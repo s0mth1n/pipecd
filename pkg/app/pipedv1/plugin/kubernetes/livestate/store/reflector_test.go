@@ -15,7 +15,19 @@
 package store
 
 import (
+	"context"
+	"slices"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
+
+	"github.com/pipe-cd/pipecd/pkg/app/pipedv1/plugin/kubernetes/provider"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -212,5 +224,74 @@ func TestNewResourceMatcher(t *testing.T) {
 	}
 	if len(matcher.excludes) != 2 {
 		t.Errorf("Expected 2 excludes, got %d", len(matcher.excludes))
+	}
+}
+
+func TestReflector_OnDelete(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		deleted     any
+		want        []types.UID
+		wantManaged []types.UID
+		noFill      bool
+	}{
+		{name: "managed resource", deleted: "managed", want: []types.UID{"child"}},
+		{name: "managed resource tombstone", deleted: cache.DeletedFinalStateUnknown{Key: "managed"}, want: []types.UID{"child"}},
+		{name: "child resource", deleted: "child", want: []types.UID{"managed"}, wantManaged: []types.UID{"managed"}},
+		{name: "child resource tombstone", deleted: cache.DeletedFinalStateUnknown{Key: "child"}, want: []types.UID{"managed"}, wantManaged: []types.UID{"managed"}},
+		{name: "missing tombstone object", deleted: cache.DeletedFinalStateUnknown{Key: "missing"}, noFill: true, want: []types.UID{"managed", "child"}, wantManaged: []types.UID{"managed"}},
+		{name: "invalid object", deleted: 1, want: []types.UID{"managed", "child"}, wantManaged: []types.UID{"managed"}},
+		{name: "invalid tombstone", deleted: cache.DeletedFinalStateUnknown{Key: "managed", Obj: 1}, want: []types.UID{"managed", "child"}, wantManaged: []types.UID{"managed"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			managed := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "apps/v1", "kind": "Deployment"}}
+			managed.SetName("managed")
+			managed.SetUID("managed")
+			managed.SetAnnotations(map[string]string{provider.LabelApplication: "app", provider.LabelManagedBy: provider.ManagedByPiped})
+			child := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "v1", "kind": "Pod"}}
+			child.SetName("child")
+			child.SetUID("child")
+			child.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "managed", UID: "managed"}})
+			resources := newDeployTargetResources("target")
+			r := &reflector{resourceEventHandler: resources, logger: zap.NewNop()}
+			r.OnAdd(managed, false)
+			r.OnAdd(child, false)
+			before, err := resources.Livestate(context.Background(), "app")
+			require.NoError(t, err)
+			require.Len(t, before, 2)
+			deleted := tt.deleted
+			objects := map[string]*unstructured.Unstructured{"managed": managed, "child": child}
+			switch v := deleted.(type) {
+			case string:
+				deleted = objects[v]
+			case cache.DeletedFinalStateUnknown:
+				if v.Obj == nil && !tt.noFill {
+					v.Obj = objects[v.Key]
+				}
+				deleted = v
+			}
+			r.OnDelete(deleted)
+			after, err := resources.Livestate(context.Background(), "app")
+			require.NoError(t, err)
+			ids := make([]types.UID, 0, len(after))
+			managedIDs := make([]types.UID, 0, len(after))
+			for _, m := range after {
+				ids = append(ids, m.UID())
+				if m.IsManagedByPiped() {
+					managedIDs = append(managedIDs, m.UID())
+				}
+			}
+			assert.ElementsMatch(t, tt.want, ids)
+			assert.ElementsMatch(t, tt.wantManaged, managedIDs)
+			resources.mu.RLock()
+			_, exists := resources.resources["managed"]
+			_, childExists := resources.resources["child"]
+			resources.mu.RUnlock()
+			assert.Equal(t, len(tt.wantManaged) > 0, exists)
+			assert.Equal(t, slices.Contains(tt.want, types.UID("child")), childExists)
+		})
 	}
 }

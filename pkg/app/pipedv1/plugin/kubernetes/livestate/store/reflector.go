@@ -249,6 +249,10 @@ func (r *reflector) OnUpdate(oldObj, newObj any) {
 
 // OnDelete implements cache.ResourceEventHandler.
 func (r *reflector) OnDelete(obj any) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+
 	u, ok := obj.(*unstructured.Unstructured)
 	if !ok {
 		r.logger.Error("failed to convert object to unstructured", zap.Any("object", obj))
