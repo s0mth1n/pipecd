@@ -19,7 +19,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/cache"
+
+	provider "github.com/pipe-cd/pipecd/pkg/app/piped/platformprovider/kubernetes"
 
 	"github.com/pipe-cd/pipecd/pkg/config"
 )
@@ -84,5 +89,45 @@ func TestResourceMatcher(t *testing.T) {
 				assert.Equal(t, expected, matched)
 			})
 		}
+	}
+}
+
+func TestReflector_onObjectDelete(t *testing.T) {
+	t.Parallel()
+
+	obj := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "v1", "kind": "Pod"}}
+	obj.SetName("pod")
+	obj.SetUID("uid")
+	other := obj.DeepCopy()
+	other.SetAnnotations(map[string]string{provider.LabelPiped: "other"})
+	for _, tt := range []struct {
+		name string
+		obj  any
+		want bool
+	}{
+		{"direct", obj, true},
+		{"tombstone", cache.DeletedFinalStateUnknown{Key: "pod", Obj: obj}, true},
+		{"other piped", other, false},
+		{"other piped tombstone", cache.DeletedFinalStateUnknown{Key: "pod", Obj: other}, false},
+		{"missing object", cache.DeletedFinalStateUnknown{Key: "pod"}, false},
+		{"invalid tombstone", cache.DeletedFinalStateUnknown{Key: "pod", Obj: 1}, false},
+		{"invalid object", 1, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var deleted []*unstructured.Unstructured
+			r := reflector{
+				pipedConfig: &config.PipedSpec{PipedID: "piped"},
+				logger:      zap.NewNop(),
+				onDelete: func(u *unstructured.Unstructured) {
+					deleted = append(deleted, u)
+				},
+			}
+			assert.NotPanics(t, func() { r.onObjectDelete(tt.obj) })
+			if tt.want {
+				assert.Equal(t, []*unstructured.Unstructured{obj}, deleted)
+			} else {
+				assert.Empty(t, deleted)
+			}
+		})
 	}
 }

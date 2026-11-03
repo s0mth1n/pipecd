@@ -256,7 +256,14 @@ func (r *reflector) onObjectUpdate(oldObj, obj any) {
 }
 
 func (r *reflector) onObjectDelete(obj any) {
-	u := obj.(*unstructured.Unstructured)
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		r.logger.Error("failed to convert object to unstructured", zap.Any("object", obj))
+		return
+	}
 	key := provider.MakeResourceKey(u)
 
 	// Ignore all objects that are not handled by this piped.
